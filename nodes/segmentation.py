@@ -723,17 +723,15 @@ class SAM3MultipromptSegmentation(io.ComfyNode):
             empty_mask = torch.zeros(1, img_h, img_w)
             return io.NodeOutput(empty_mask, pil_to_comfy_image(pil_image))
 
-        # Set image once (feature extraction)
-        # Smoke-test CUDA before set_image
-        _dev = getattr(processor, 'device', 'cpu')
-        try:
-            _probe = torch.zeros(1, device=_dev)
-            del _probe
-            log.warning("[DBG] CUDA probe OK on %s, image=%dx%d, lowvram=%s",
-                         _dev, img_w, img_h, getattr(sam3_model.model, 'model_lowvram', 'N/A'))
-        except Exception as _e:
-            log.error("[DBG] CUDA probe FAILED on %s: %s", _dev, _e)
+        # Flush pending async CUDA ops and reclaim memory pool before the
+        # heavy backbone forward pass.  Without this, cudaMallocAsync can
+        # non-deterministically fail with "CUDA error: invalid argument"
+        # on large images in NO_VRAM / lowvram mode.
+        gc.collect()
+        comfy.model_management.soft_empty_cache(force=True)
+        torch.cuda.synchronize(comfy.model_management.get_torch_device())
 
+        # Set image once (feature extraction)
         state = processor.set_image(pil_image)
 
         all_masks = []

@@ -1307,12 +1307,11 @@ class Sam3Processor:
             height, width = image.shape[-2:]
         else:
             raise ValueError("Image must be a PIL image or a tensor")
-        image = v2.functional.to_image(image).to(self.device)
-        image = self.transform(image).unsqueeze(0)
-        # Cast image to match the backbone's native weight dtype so that
-        # manual_cast keeps weights in their stored precision (typically bf16).
-        # Without this, an fp32 image causes manual_cast to promote bf16
-        # weights to fp32, producing different features than the original model.
+        # Transform on CPU first (resize from e.g. 6720x4480 to 1008x1008),
+        # then move only the small tensor to GPU.  Avoids a large transient
+        # GPU allocation that can destabilise cudaMallocAsync in lowvram mode.
+        image = v2.functional.to_image(image)
+        image = self.transform(image).unsqueeze(0).to(self.device)
         # Cast image to match the backbone's native weight dtype so that
         # manual_cast keeps weights in their stored precision (typically bf16).
         # Without this, an fp32 image causes manual_cast to promote bf16

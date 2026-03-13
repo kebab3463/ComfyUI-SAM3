@@ -6,8 +6,6 @@
 
 import { app } from "../../scripts/app.js";
 
-console.log("[SAM3] ===== INTERACTIVE COLLECTOR VERSION 2 =====");
-
 const PROMPT_COLORS = [
     { name: "cyan",    primary: "#00FFFF", dim: "#006666" },
     { name: "yellow",  primary: "#FFFF00", dim: "#666600" },
@@ -471,7 +469,6 @@ app.registerExtension({
             const cw = this.canvasWidget;
             const active = cw.prompts[cw.activePromptIndex];
             const blocked = active && (active.isRunning || active.isPending);
-            console.log(`[SAM3] updateRunButton: active="${active?.name}", isRunning=${active?.isRunning}, isPending=${active?.isPending}, blocked=${!!blocked}`);
             cw.runBtn.textContent = "Run";
             cw.runBtn.disabled = !!blocked;
             cw.runBtn.style.background = blocked ? "#333" : "#2a7a2a";
@@ -649,7 +646,6 @@ app.registerExtension({
                 name: `Prompt ${newIndex}`,
             });
             this.canvasWidget.activePromptIndex = this.canvasWidget.prompts.length - 1;
-            console.log(`[SAM3] New prompt tab created: "Prompt ${newIndex}", activeIndex=${this.canvasWidget.activePromptIndex}`);
             this.rebuildTabBar();
             this.updateRunButton();
             this.updateStorage();
