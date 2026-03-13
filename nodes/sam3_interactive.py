@@ -19,7 +19,6 @@ import numpy as np
 import torch
 from PIL import Image
 
-import comfy.model_management
 import comfy.utils
 
 from comfy_api.latest import io
@@ -615,6 +614,7 @@ class SAM3InteractiveCollector(io.ComfyNode):
     @staticmethod
     def _run_prompts(model, state, multi_prompts, img_w, img_h):
         """Run predict_inst for each prompt, return stacked masks + scores."""
+        import comfy.model_management
         all_masks = []
         all_scores = []
         pbar = comfy.utils.ProgressBar(len(multi_prompts))

@@ -11,7 +11,6 @@ import torch
 import numpy as np
 import gc
 
-import comfy.model_management
 import comfy.utils
 
 log = logging.getLogger("sam3")
