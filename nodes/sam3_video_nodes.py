@@ -18,9 +18,6 @@ import numpy as np
 from pathlib import Path
 from typing import Optional, Tuple
 
-import comfy.model_management
-import comfy.utils
-
 log = logging.getLogger("sam3")
 
 import folder_paths
@@ -418,6 +415,8 @@ class SAM3Propagate(io.ComfyNode):
     @classmethod
     def execute(cls, sam3_model_config, video_state, start_frame=0, end_frame=-1, direction="forward"):
         """Run propagation using reconstructed inference state."""
+        import comfy.model_management
+        import comfy.utils
         from ._model_cache import get_or_build_model
 
         sam3_model = get_or_build_model(sam3_model_config)
@@ -619,6 +618,8 @@ class SAM3VideoOutput(io.ComfyNode):
         Uses numpy.memmap to write output directly to disk, avoiding OOM for large videos.
         Memory usage is ~100MB regardless of video size (vs 32GB+ for 551 frames at 1080p).
         """
+        import comfy.model_management
+        import comfy.utils
         from PIL import Image
         import os
 
