@@ -8,9 +8,12 @@ Provides a single ModelPatcher subclass that integrates with:
 """
 
 import gc
+import logging
 import torch
 import comfy.model_management
 from comfy.model_patcher import ModelPatcher
+
+log = logging.getLogger("sam3")
 
 
 class SAM3UnifiedModel(ModelPatcher):
@@ -28,12 +31,6 @@ class SAM3UnifiedModel(ModelPatcher):
         self._load_device = load_device
         self._offload_device = offload_device
         self._model_dtype = dtype or torch.float32
-        # Set inference dtype on processor immediately so set_image() always
-        # casts image inputs to bf16/fp16 before backbone forward.
-        self._processor._inference_dtype = self._model_dtype
-        import logging, os
-        if os.environ.get("DEBUG_COMFYUI_SAM3", "").lower() in ("1", "true", "yes"):
-            logging.getLogger("sam3").warning("SAM3UnifiedModel: dtype=%s, processor._inference_dtype=%s", self._model_dtype, self._processor._inference_dtype)
 
         # The full model (detector + tracker) is the nn.Module we manage
         full_model = video_predictor.model
@@ -57,10 +54,7 @@ class SAM3UnifiedModel(ModelPatcher):
     @property
     def current_device(self):
         """Current device the model is on."""
-        try:
-            return next(self.model.parameters()).device
-        except StopIteration:
-            return self._offload_device
+        return self.model.device
 
     # -- Video predictor delegation -------------------------------------------
 
@@ -87,21 +81,19 @@ class SAM3UnifiedModel(ModelPatcher):
     # -- ModelPatcher overrides -----------------------------------------------
 
     def patch_model(self, device_to=None, lowvram_model_memory=0, load_weights=True, force_patch_weights=False):
+        result = super().patch_model(device_to, lowvram_model_memory, load_weights, force_patch_weights)
         if device_to is None:
             device_to = self._load_device
-        self.model.to(device_to)
-        # Native ComfyUI pattern: weights stay in checkpoint dtype (fp32).
-        # manual_cast handles per-layer casting to match input dtype.
         self._sync_processor_device(device_to)
-        return self.model
+        self._sync_model_device(device_to)
+        return result
 
     def unpatch_model(self, device_to=None, unpatch_weights=True):
+        super().unpatch_model(device_to, unpatch_weights)
         if device_to is None:
             device_to = self._offload_device
-        self.model.to(device_to)
         self._sync_processor_device(device_to)
-        gc.collect()
-        comfy.model_management.soft_empty_cache()
+        self._sync_model_device(device_to)
 
     def clone(self):
         n = SAM3UnifiedModel(
@@ -122,33 +114,6 @@ class SAM3UnifiedModel(ModelPatcher):
         activation_memory = 1008 * 1008 * 256 * 4 * 10
         return base_memory + activation_memory
 
-    def model_patches_to(self, device):
-        pass
-
-    def model_patches_models(self):
-        return []
-
-    def current_loaded_device(self):
-        return self.current_device
-
-    def loaded_size(self):
-        device = self.current_device
-        if device is not None and device.type != "cpu":
-            return self.model_size()
-        return 0
-
-    def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
-        self.patch_model(device_to)
-        return self.model_size()
-
-    def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
-        self.unpatch_model(device_to)
-        return self.model_size()
-
-    def cleanup(self):
-        self.unpatch_model()
-        super().cleanup()
-
     def __del__(self):
         try:
             self.cleanup()
@@ -157,18 +122,27 @@ class SAM3UnifiedModel(ModelPatcher):
 
     # -- Internal helpers -----------------------------------------------------
 
+    def _sync_model_device(self, device):
+        """Set compute device on model objects so .device returns the correct
+        device in offload mode (where parameters stay on CPU but computation
+        happens on CUDA).  All SAM3 model classes check _device first."""
+        self.model.device = device
+        if hasattr(self.model, 'inst_interactive_predictor'):
+            pred = self.model.inst_interactive_predictor
+            if hasattr(pred, 'model'):
+                pred.model.device = device
+
     def _sync_processor_device(self, device):
-        """Sync processor's cached device state after model movement."""
-        # Tell the processor what dtype to cast image inputs to.
-        # manual_cast layers will then match their weights to the input dtype.
-        self._processor._inference_dtype = self._model_dtype
-        if hasattr(self._processor, 'sync_device_with_model'):
-            self._processor.sync_device_with_model()
-        elif hasattr(self._processor, 'device'):
-            self._processor.device = str(device)
-            if hasattr(self._processor, 'find_stage') and self._processor.find_stage is not None:
-                fs = self._processor.find_stage
-                if hasattr(fs, 'img_ids') and fs.img_ids is not None:
-                    fs.img_ids = fs.img_ids.to(device)
-                if hasattr(fs, 'text_ids') and fs.text_ids is not None:
-                    fs.text_ids = fs.text_ids.to(device)
+        """Sync processor's device and dtype after model movement.
+
+        Follows the native ComfyUI pattern: the patcher owns device state and
+        pushes it to the processor as a torch.device (like ClipVisionModel.load_device).
+        """
+        if hasattr(self._processor, 'device'):
+            self._processor.device = device
+        if hasattr(self._processor, 'find_stage') and self._processor.find_stage is not None:
+            fs = self._processor.find_stage
+            if hasattr(fs, 'img_ids') and fs.img_ids is not None:
+                fs.img_ids = fs.img_ids.to(device)
+            if hasattr(fs, 'text_ids') and fs.text_ids is not None:
+                fs.text_ids = fs.text_ids.to(device)

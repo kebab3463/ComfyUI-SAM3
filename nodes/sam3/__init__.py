@@ -635,7 +635,7 @@ def _load_checkpoint(model, checkpoint_path):
     # Convert nn.MultiheadAttention in_proj_weight/bias to split q/k/v
     sam3_image_ckpt = convert_mha_state_dict(sam3_image_ckpt)
 
-    missing_keys, unexpected_keys = model.load_state_dict(sam3_image_ckpt, strict=False, assign=True)
+    missing_keys, unexpected_keys = model.load_state_dict(sam3_image_ckpt, strict=False)
 
     # Check for missing inst_interactive_predictor keys
     critical_missing = [k for k in missing_keys if 'inst_interactive_predictor' in k]
@@ -738,11 +738,41 @@ def build_sam3_image_model(
     if checkpoint_path is not None:
         _load_checkpoint(model, checkpoint_path)
 
-    model = model.to(device)
+    # Model stays on CPU — ModelPatcher handles device placement.
     if eval_mode:
         model.eval()
 
     return model
+
+
+def remap_video_checkpoint(
+    ckpt: dict,
+    enable_inst_interactivity: bool = False,
+) -> dict:
+    """
+    Remap a raw checkpoint dict for Sam3VideoInferenceWithInstanceInteractivity.
+
+    Handles inst_interactive_predictor key remapping and MHA -> split Q/K/V
+    conversion.  Returned dict is ready for ``model.load_state_dict()``.
+    """
+    if "model" in ckpt and isinstance(ckpt["model"], dict):
+        ckpt = ckpt["model"]
+
+    remapped_ckpt = dict(ckpt)
+
+    # If inst_interactive_predictor is enabled, remap tracker weights for it
+    if enable_inst_interactivity:
+        inst_predictor_keys = {
+            k.replace("tracker.", "detector.inst_interactive_predictor.model."): v
+            for k, v in remapped_ckpt.items()
+            if k.startswith("tracker.")
+        }
+        remapped_ckpt.update(inst_predictor_keys)
+        log.info(f"Added {len(inst_predictor_keys)} keys for detector.inst_interactive_predictor")
+
+    # Convert nn.MultiheadAttention in_proj_weight/bias to split q/k/v
+    remapped_ckpt = convert_mha_state_dict(remapped_ckpt)
+    return remapped_ckpt
 
 
 def build_sam3_video_model(
@@ -754,6 +784,7 @@ def build_sam3_video_model(
     apply_temporal_disambiguation: bool = True,
     device=None,
     enable_inst_interactivity: bool = False,
+    skip_checkpoint: bool = False,
     **kwargs,
 ):
     """
@@ -766,14 +797,11 @@ def build_sam3_video_model(
     Returns:
         Sam3VideoInferenceWithInstanceInteractivity: The instantiated dense tracking model
     """
-    # Configure attention backend before building any modules
-    attention_backend = kwargs.pop("attention_backend", "auto")
+    kwargs.pop("attention_backend", None)  # removed: ComfyUI handles backend selection
     kwargs.pop("compile", None)  # consumed by caller, not needed here
-    from .attention import set_sam3_backend
-    set_sam3_backend(attention_backend)
 
-    if device is None:
-        device = comfy.model_management.get_torch_device()
+    # device parameter kept for API compat but no longer used —
+    # ModelPatcher handles device placement.
 
     if bpe_path is None:
         bpe_path = os.path.join(
@@ -879,38 +907,27 @@ def build_sam3_video_model(
             image_std=(0.5, 0.5, 0.5),
         )
 
-    # Load checkpoint if provided
-    if load_from_HF and checkpoint_path is None:
-        checkpoint_path = download_ckpt_from_hf()
-    if checkpoint_path is not None:
-        ckpt = _load_checkpoint_file(checkpoint_path)
-        if "model" in ckpt and isinstance(ckpt["model"], dict):
-            ckpt = ckpt["model"]
+    # Load checkpoint if provided (skipped when caller handles loading, e.g.
+    # meta-device construction in load_model.py).
+    if not skip_checkpoint:
+        if load_from_HF and checkpoint_path is None:
+            checkpoint_path = download_ckpt_from_hf()
+        if checkpoint_path is not None:
+            ckpt = _load_checkpoint_file(checkpoint_path)
+            remapped_ckpt = remap_video_checkpoint(
+                ckpt,
+                enable_inst_interactivity=(enable_inst_interactivity and inst_predictor is not None),
+            )
 
-        remapped_ckpt = dict(ckpt)
+            missing_keys, unexpected_keys = model.load_state_dict(
+                remapped_ckpt, strict=strict_state_dict_loading
+            )
+            if missing_keys:
+                log.info(f"Missing keys: {len(missing_keys)}")
+            if unexpected_keys:
+                log.info(f"Unexpected keys: {len(unexpected_keys)}")
 
-        # If inst_interactive_predictor is enabled, remap tracker weights for it
-        if enable_inst_interactivity and inst_predictor is not None:
-            inst_predictor_keys = {
-                k.replace("tracker.", "detector.inst_interactive_predictor.model."): v
-                for k, v in remapped_ckpt.items()
-                if k.startswith("tracker.")
-            }
-            remapped_ckpt.update(inst_predictor_keys)
-            log.info(f"Added {len(inst_predictor_keys)} keys for detector.inst_interactive_predictor")
-
-        # Convert nn.MultiheadAttention in_proj_weight/bias to split q/k/v
-        remapped_ckpt = convert_mha_state_dict(remapped_ckpt)
-
-        missing_keys, unexpected_keys = model.load_state_dict(
-            remapped_ckpt, strict=strict_state_dict_loading, assign=True
-        )
-        if missing_keys:
-            log.info(f"Missing keys: {len(missing_keys)}")
-        if unexpected_keys:
-            log.info(f"Unexpected keys: {len(unexpected_keys)}")
-
-    model.to(device=device)
+    # Model stays on CPU — ModelPatcher handles device placement.
     return model
 
 
@@ -928,6 +945,7 @@ __all__ = [
     "build_sam3_image_model",
     "build_sam3_video_model",
     "build_sam3_video_predictor",
+    "remap_video_checkpoint",
     "_load_checkpoint_file",
     "convert_mha_state_dict",
 ]

@@ -30,18 +30,19 @@ _sam3_log = logging.getLogger("sam3")
 
 def _dtype_debug(label, **tensors):
     """Log dtype/shape of tensors at component boundaries."""
-    if not _SAM3_DEBUG:
-        return
     parts = [f"{label}:"]
     for name, t in tensors.items():
         if t is None:
             parts.append(f"  {name}=None")
         elif isinstance(t, (list, tuple)):
-            dtypes = [x.dtype for x in t if hasattr(x, 'dtype')]
-            parts.append(f"  {name}=[{', '.join(str(d) for d in dtypes)}]")
+            info = []
+            for x in t:
+                if hasattr(x, 'dtype'):
+                    info.append(f"{x.dtype} {list(x.shape)}")
+            parts.append(f"  {name}=[{', '.join(info)}]")
         elif hasattr(t, 'dtype'):
-            parts.append(f"  {name}={t.dtype} {list(t.shape)}")
-    _sam3_log.warning(" ".join(parts))
+            parts.append(f"  {name}={t.dtype} {list(t.shape)} min={t.min():.4f} max={t.max():.4f}")
+    _sam3_log.debug(" ".join(parts))
 
 
 def is_image_type(resource_path):
@@ -62,7 +63,6 @@ from copy import copy
 from torch import Tensor
 from torchvision.ops import masks_to_boxes
 from torchvision.ops.roi_align import RoIAlign
-from tqdm.auto import tqdm
 from typing_extensions import override
 
 from .attention import (
@@ -420,8 +420,8 @@ class PositionEmbeddingRandom(nn.Module):
 
     def _pe_encoding(self, coords: torch.Tensor) -> torch.Tensor:
         coords = 2 * coords - 1
-        coords = coords.to(self.positional_encoding_gaussian_matrix.dtype)
-        coords = coords @ self.positional_encoding_gaussian_matrix
+        pe_matrix = comfy.ops.cast_to_input(self.positional_encoding_gaussian_matrix, coords)
+        coords = coords @ pe_matrix
         coords = 2 * np.pi * coords
         return torch.cat([torch.sin(coords), torch.cos(coords)], dim=-1)
 
@@ -550,11 +550,11 @@ def concat_rel_pos(
     k_h, k_w = k_hw
     assert (q_h == q_w) and (k_h == k_w), "only square inputs supported"
     if relative_coords is not None:
-        Rh = rel_pos_h[relative_coords].to(q.dtype)
-        Rw = rel_pos_w[relative_coords].to(q.dtype)
+        Rh = comfy.ops.cast_to_input(rel_pos_h[relative_coords], q)
+        Rw = comfy.ops.cast_to_input(rel_pos_w[relative_coords], q)
     else:
-        Rh = get_rel_pos(q_h, k_h, rel_pos_h).to(q.dtype)
-        Rw = get_rel_pos(q_w, k_w, rel_pos_w).to(q.dtype)
+        Rh = comfy.ops.cast_to_input(get_rel_pos(q_h, k_h, rel_pos_h), q)
+        Rw = comfy.ops.cast_to_input(get_rel_pos(q_w, k_w, rel_pos_w), q)
     B, _, dim = q.shape
     r_q = q.reshape(B, q_h, q_w, dim)
     old_scale = dim**0.5
@@ -967,14 +967,14 @@ class ViT(nn.Module):
 
         s = 0
         if self.retain_cls_token:
-            x = torch.cat([self.class_embedding.to(x.dtype), x.flatten(1, 2)], dim=1)
+            x = torch.cat([comfy.ops.cast_to_input(self.class_embedding, x), x.flatten(1, 2)], dim=1)
             s = 1
 
         if self.pos_embed is not None:
-            x = x + get_abs_pos(
+            x = x + comfy.ops.cast_to_input(get_abs_pos(
                 self.pos_embed, self.pretrain_use_cls_token,
                 (h, w), self.retain_cls_token, tiling=self.tile_abs_pos,
-            ).to(x.dtype)
+            ), x)
 
         x = self.ln_pre(x)
 
@@ -1227,7 +1227,7 @@ class TransformerEncoder(nn.Module):
                 mask = mask.flatten(1)
             pos_embed = pos_embed.flatten(2).transpose(1, 2)
             if self.level_embed is not None:
-                lvl_pos_embed = pos_embed + self.level_embed[lvl].view(1, 1, -1).to(pos_embed.dtype)
+                lvl_pos_embed = pos_embed + comfy.ops.cast_to_input(self.level_embed[lvl].view(1, 1, -1), pos_embed)
             else:
                 lvl_pos_embed = pos_embed
             lvl_pos_embed_flatten.append(lvl_pos_embed)
@@ -1711,7 +1711,7 @@ class TransformerDecoder(nn.Module):
         presence_feats = None
         if self.box_refine:
             if reference_boxes is None:
-                reference_boxes = self.reference_points.weight.unsqueeze(1).to(tgt.dtype)
+                reference_boxes = self.reference_points.weight.unsqueeze(1).to(device=tgt.device, dtype=tgt.dtype)
                 reference_boxes = (
                     reference_boxes.repeat(2, bs, 1) if apply_dac
                     else reference_boxes.repeat(1, bs, 1)
@@ -1724,7 +1724,7 @@ class TransformerDecoder(nn.Module):
         output = tgt
         presence_out = None
         if self.presence_token is not None and is_instance_prompt is False:
-            presence_out = self.presence_token.weight[None].expand(1, bs, -1).to(tgt.dtype)
+            presence_out = self.presence_token.weight[None].expand(1, bs, -1).to(device=tgt.device, dtype=tgt.dtype)
         box_head = self.bbox_embed
         if is_instance_prompt and self.instance_bbox_embed is not None:
             box_head = self.instance_bbox_embed
@@ -1785,11 +1785,12 @@ class TransformerDecoder(nn.Module):
                 raise NotImplementedError("not implemented yet")
             intermediate.append(out_norm(output))
             if self.presence_token is not None and is_instance_prompt is False:
+                normed_presence = self.presence_token_out_norm(presence_out)
                 intermediate_layer_presence_logits = self.presence_token_head(
-                    self.presence_token_out_norm(presence_out)
+                    normed_presence
                 ).squeeze(-1)
                 if self.clamp_presence_logits:
-                    intermediate_layer_presence_logits.clamp(
+                    intermediate_layer_presence_logits = intermediate_layer_presence_logits.clamp(
                         min=-self.clamp_presence_logit_max_val,
                         max=self.clamp_presence_logit_max_val,
                     )
@@ -2150,7 +2151,7 @@ class CXBlock(nn.Module):
         x = self.act(x)
         x = self.pwconv2(x)
         if self.gamma is not None:
-            x = self.gamma.to(x.dtype) * x
+            x = comfy.ops.cast_to_input(self.gamma, x) * x
         x = x.permute(0, 3, 1, 2)
         x = input + self.drop_path(x)
         return x
@@ -2322,6 +2323,11 @@ class SequenceGeometryEncoder(nn.Module):
         self.mask_encoder = mask_encoder
 
     def _encode_points(self, points, points_mask, points_labels, img_feats):
+        # Ensure all inputs are on the same device as img_feats (offload mode)
+        _dev = img_feats.device if isinstance(img_feats, torch.Tensor) else img_feats[-1].device
+        points = points.to(_dev)
+        points_mask = points_mask.to(_dev)
+        points_labels = points_labels.to(_dev)
         points_embed = None
         n_points, bs = points.shape[:2]
         if self.points_direct_project is not None:
@@ -2350,11 +2356,19 @@ class SequenceGeometryEncoder(nn.Module):
                 points_embed = proj
             else:
                 points_embed = points_embed + proj
-        type_embed = self.label_embed(points_labels.long())
+        type_embed = self.label_embed(points_labels.long()).to(points_embed.device)
         return type_embed + points_embed, points_mask
 
     def _encode_boxes(self, boxes, boxes_mask, boxes_labels, img_feats):
         import torchvision
+        # Ensure boxes are on the same device as img_feats (needed for roi_align on CUDA)
+        _dev = img_feats.device if isinstance(img_feats, torch.Tensor) else img_feats[-1].device
+        if boxes.device != _dev:
+            boxes = boxes.to(_dev)
+        if boxes_mask.device != _dev:
+            boxes_mask = boxes_mask.to(_dev)
+        if boxes_labels.device != _dev:
+            boxes_labels = boxes_labels.to(_dev)
         boxes_embed = None
         n_boxes, bs = boxes.shape[:2]
         if self.boxes_direct_project is not None:
@@ -2392,10 +2406,16 @@ class SequenceGeometryEncoder(nn.Module):
                 boxes_embed = proj
             else:
                 boxes_embed = boxes_embed + proj
-        type_embed = self.label_embed(boxes_labels.long())
+        type_embed = self.label_embed(boxes_labels.long()).to(boxes_embed.device)
         return type_embed + boxes_embed, boxes_mask
 
     def _encode_masks(self, masks, attn_mask, mask_labels, img_feats=None):
+        # Ensure mask inputs on same device as img_feats (offload mode)
+        if img_feats is not None:
+            _dev = img_feats.device if isinstance(img_feats, torch.Tensor) else img_feats[-1].device
+            masks = masks.to(_dev)
+            attn_mask = attn_mask.to(_dev)
+            mask_labels = mask_labels.to(_dev)
         n_masks, bs = masks.shape[:2]
         assert n_masks == 1
         assert list(attn_mask.shape) == [bs, n_masks]
@@ -2407,7 +2427,7 @@ class SequenceGeometryEncoder(nn.Module):
         masks = masks.permute(0, 3, 1, 2).flatten(0, 1)
         attn_mask = attn_mask.repeat_interleave(n_tokens_per_mask, dim=1)
         if self.add_mask_label:
-            masks = masks + self.mask_label_embed(mask_labels.long())
+            masks = masks + self.mask_label_embed(mask_labels.long()).to(masks.device)
         return masks, attn_mask
 
     def forward(self, geo_prompt: Prompt, img_feats, img_sizes, img_pos_embeds=None):
@@ -2478,7 +2498,7 @@ class SequenceGeometryEncoder(nn.Module):
         bs = final_embeds.shape[1]
         assert final_mask.shape[0] == bs
         if self.cls_embed is not None:
-            cls = self.cls_embed.weight.view(1, 1, self.d_model).repeat(1, bs, 1).to(final_embeds.dtype)
+            cls = self.cls_embed.weight.view(1, 1, self.d_model).repeat(1, bs, 1).to(device=final_embeds.device, dtype=final_embeds.dtype)
             cls_mask = torch.zeros(bs, 1, dtype=final_mask.dtype, device=final_mask.device)
             final_embeds, final_mask = concat_padded_sequences(
                 final_embeds, final_mask, cls, cls_mask
@@ -2569,27 +2589,27 @@ class PromptEncoder(nn.Module):
 
         point_embedding = torch.where(
             (labels == -1).unsqueeze(-1),
-            torch.zeros_like(point_embedding) + self.not_a_point_embed.weight,
+            torch.zeros_like(point_embedding) + comfy.ops.cast_to_input(self.not_a_point_embed.weight, point_embedding),
             point_embedding,
         )
         point_embedding = torch.where(
             (labels == 0).unsqueeze(-1),
-            point_embedding + self.point_embeddings[0].weight,
+            point_embedding + comfy.ops.cast_to_input(self.point_embeddings[0].weight, point_embedding),
             point_embedding,
         )
         point_embedding = torch.where(
             (labels == 1).unsqueeze(-1),
-            point_embedding + self.point_embeddings[1].weight,
+            point_embedding + comfy.ops.cast_to_input(self.point_embeddings[1].weight, point_embedding),
             point_embedding,
         )
         point_embedding = torch.where(
             (labels == 2).unsqueeze(-1),
-            point_embedding + self.point_embeddings[2].weight,
+            point_embedding + comfy.ops.cast_to_input(self.point_embeddings[2].weight, point_embedding),
             point_embedding,
         )
         point_embedding = torch.where(
             (labels == 3).unsqueeze(-1),
-            point_embedding + self.point_embeddings[3].weight,
+            point_embedding + comfy.ops.cast_to_input(self.point_embeddings[3].weight, point_embedding),
             point_embedding,
         )
         return point_embedding
@@ -2601,8 +2621,8 @@ class PromptEncoder(nn.Module):
         corner_embedding = self.pe_layer.forward_with_coords(
             coords, self.input_image_size
         )
-        corner_embedding[:, 0, :] += self.point_embeddings[2].weight
-        corner_embedding[:, 1, :] += self.point_embeddings[3].weight
+        corner_embedding[:, 0, :] += comfy.ops.cast_to_input(self.point_embeddings[2].weight, corner_embedding)
+        corner_embedding[:, 1, :] += comfy.ops.cast_to_input(self.point_embeddings[3].weight, corner_embedding)
         return corner_embedding
 
     def _embed_masks(self, masks: torch.Tensor) -> torch.Tensor:
@@ -2635,9 +2655,18 @@ class PromptEncoder(nn.Module):
         masks: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         bs = self._get_batch_size(points, boxes, masks)
+        # Derive device/dtype from input tensors (always on compute device),
+        # not from .weight which may be offloaded to CPU in lowvram mode.
+        if points is not None:
+            device, dtype = points[0].device, points[0].dtype
+        elif boxes is not None:
+            device, dtype = boxes.device, boxes.dtype
+        elif masks is not None:
+            device, dtype = masks.device, masks.dtype
+        else:
+            device, dtype = self._get_device(), self.point_embeddings[0].weight.dtype
         sparse_embeddings = torch.empty(
-            (bs, 0, self.embed_dim), device=self._get_device(),
-            dtype=self.point_embeddings[0].weight.dtype,
+            (bs, 0, self.embed_dim), device=device, dtype=dtype,
         )
         if points is not None:
             coords, labels = points
@@ -2650,7 +2679,9 @@ class PromptEncoder(nn.Module):
         if masks is not None:
             dense_embeddings = self._embed_masks(masks)
         else:
-            dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+            dense_embeddings = comfy.ops.cast_to_input(
+                self.no_mask_embed.weight, sparse_embeddings
+            ).reshape(1, -1, 1, 1).expand(
                 bs, -1, self.image_embedding_size[0], self.image_embedding_size[1]
             )
 
@@ -2814,7 +2845,7 @@ class MaskDecoder(nn.Module):
             )
         output_tokens = output_tokens.unsqueeze(0).expand(
             sparse_prompt_embeddings.size(0), -1, -1
-        )
+        ).to(sparse_prompt_embeddings.device)
         tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)
 
         # Expand per-image data in batch direction to be per-mask
@@ -2823,7 +2854,7 @@ class MaskDecoder(nn.Module):
         else:
             assert image_embeddings.shape[0] == tokens.shape[0]
             src = image_embeddings
-        src = src + dense_prompt_embeddings.to(src.dtype)
+        src = src + dense_prompt_embeddings.to(device=src.device, dtype=src.dtype)
         import os as _os
         if _os.environ.get("DEBUG_COMFYUI_SAM3", "").lower() in ("1", "true", "yes"):
             import logging as _logging
@@ -2835,7 +2866,7 @@ class MaskDecoder(nn.Module):
         assert (
             image_pe.size(0) == 1
         ), "image_pe should have size 1 in batch dim (from `get_dense_pe()`)"
-        pos_src = torch.repeat_interleave(image_pe, tokens.shape[0], dim=0)
+        pos_src = torch.repeat_interleave(image_pe, tokens.shape[0], dim=0).to(src.device)
         b, c, h, w = src.shape
 
         # Run the transformer
@@ -3052,6 +3083,10 @@ class SegmentationHead(nn.Module):
         self._device = getattr(self, "_device", None) or next(self.parameters()).device
         return self._device
 
+    @device.setter
+    def device(self, value):
+        self._device = value
+
     def to(self, *args, **kwargs):
         self._device = None
         return super().to(*args, **kwargs)
@@ -3263,12 +3298,6 @@ class SAM3VLBackbone(nn.Module):
         _dtype_debug("Backbone.forward_image IN", samples=samples)
         if samples.dtype == torch.uint8:
             samples = samples.float() / 255.0
-        try:
-            expected_device = next(self.vision_backbone.parameters()).device
-            if samples.device != expected_device:
-                samples = samples.to(expected_device)
-        except StopIteration:
-            pass
         result = self._forward_image_no_act_ckpt(samples)
         _dtype_debug("Backbone.forward_image OUT",
                      vision_features=result.get("vision_features"),
@@ -3441,6 +3470,10 @@ class Sam3Image(torch.nn.Module):
         self._device = getattr(self, "_device", None) or next(self.parameters()).device
         return self._device
 
+    @device.setter
+    def device(self, value):
+        self._device = value
+
     def to(self, *args, **kwargs):
         self._device = None
         return super().to(*args, **kwargs)
@@ -3449,7 +3482,7 @@ class Sam3Image(torch.nn.Module):
         """Retrieve correct image features from backbone output."""
         if "backbone_fpn" in backbone_out:
             if "id_mapping" in backbone_out and backbone_out["id_mapping"] is not None:
-                img_ids = backbone_out["id_mapping"][img_ids]
+                img_ids = backbone_out["id_mapping"][img_ids.to(backbone_out["id_mapping"].device)]
                 torch._assert_async((img_ids >= 0).all())
 
             vis_feats = backbone_out["backbone_fpn"][-self.num_feature_levels :]
@@ -3472,11 +3505,12 @@ class Sam3Image(torch.nn.Module):
             image = img_batch[unique_ids.item()].unsqueeze(0)
         else:
             image = torch.stack([img_batch[i] for i in unique_ids.tolist()])
-        image = image.to(dtype=torch.float32, device=self.device)
+        _dev = image.device if image.is_cuda else self.device
+        image = image.to(dtype=torch.float32, device=_dev)
         id_mapping = torch.full(
-            (len(img_batch),), -1, dtype=torch.long, device=self.device
+            (len(img_batch),), -1, dtype=torch.long, device=_dev
         )
-        id_mapping[unique_ids] = torch.arange(len(unique_ids), device=self.device)
+        id_mapping[unique_ids] = torch.arange(len(unique_ids), device=_dev)
         backbone_out = {
             **backbone_out,
             **self.backbone.forward_image(image),
@@ -3495,17 +3529,19 @@ class Sam3Image(torch.nn.Module):
         encode_text=True,
         prev_mask_pred=None,
     ):
-        txt_ids = find_input.text_ids
-        txt_feats = backbone_out["language_features"][:, txt_ids]
+        lang_feats = backbone_out["language_features"]
+        txt_ids = find_input.text_ids.to(lang_feats.device)
+        txt_feats = lang_feats[:, txt_ids]
         txt_masks = backbone_out["language_mask"][txt_ids]
 
         feat_tuple = self._get_img_feats(backbone_out, find_input.img_ids)
         backbone_out, img_feats, img_pos_embeds, vis_feat_sizes = feat_tuple
 
-        # Cast text features to match visual features dtype (text encoder
+        # Cast text features to match visual features dtype and device (text encoder
         # outputs fp32 because Embedding receives integer indices; manual_cast
-        # can't infer target dtype from integers).
-        txt_feats = txt_feats.to(img_feats[-1].dtype)
+        # can't infer target dtype from integers. In offload mode text may be on CPU).
+        txt_feats = txt_feats.to(device=img_feats[-1].device, dtype=img_feats[-1].dtype)
+        txt_masks = txt_masks.to(img_feats[-1].device)
 
         if prev_mask_pred is not None:
             img_feats = [img_feats[-1] + prev_mask_pred]
@@ -3544,6 +3580,8 @@ class Sam3Image(torch.nn.Module):
         backbone_out, img_feats, img_pos_embeds, vis_feat_sizes = feat_tuple
 
         prompt_pos_embed = torch.zeros_like(prompt)
+        _dtype_debug("_run_encoder inputs",
+                     img_feats=img_feats, prompt=prompt, prompt_mask=prompt_mask)
         memory = self.transformer.encoder(
             src=img_feats.copy(),
             src_key_padding_mask=None,
@@ -3554,6 +3592,7 @@ class Sam3Image(torch.nn.Module):
             feat_sizes=vis_feat_sizes,
             encoder_extra_kwargs=encoder_extra_kwargs,
         )
+        _dtype_debug("_run_encoder output", memory=memory.get("memory"), pos_embed=memory.get("pos_embed"))
         encoder_out = {
             "encoder_hidden_states": memory["memory"],
             "pos_embed": memory["pos_embed"],
@@ -3580,9 +3619,11 @@ class Sam3Image(torch.nn.Module):
     ):
         bs = memory.shape[1]
         query_embed = self.transformer.decoder.query_embed.weight
-        tgt = query_embed.unsqueeze(1).repeat(1, bs, 1).to(memory.dtype)
+        tgt = query_embed.unsqueeze(1).repeat(1, bs, 1).to(device=memory.device, dtype=memory.dtype)
 
         apply_dac = self.transformer.decoder.dac and self.training
+        _dtype_debug("_run_decoder inputs", tgt=tgt, memory=memory, pos_embed=pos_embed,
+                     prompt=prompt, prompt_mask=prompt_mask)
         hs, reference_boxes, dec_presence_out, dec_presence_feats = (
             self.transformer.decoder(
                 tgt=tgt,
@@ -3599,6 +3640,8 @@ class Sam3Image(torch.nn.Module):
                 apply_dac=apply_dac,
             )
         )
+        _dtype_debug("_run_decoder output", hs=hs, reference_boxes=reference_boxes,
+                     dec_presence_out=dec_presence_out)
         hs = hs.transpose(1, 2)
         reference_boxes = reference_boxes.transpose(1, 2)
         if dec_presence_out is not None:
@@ -3630,6 +3673,7 @@ class Sam3Image(torch.nn.Module):
         num_o2m = hs.size(2) - num_o2o
         assert num_o2m == (num_o2o if apply_dac else 0)
         out["queries"] = hs[-1][:, :num_o2o]
+        _dtype_debug("_update_scores_and_boxes", hs=hs, prompt=prompt, prompt_mask=prompt_mask)
         if self.use_dot_prod_scoring:
             dot_prod_scoring_head = self.dot_prod_scoring
             if is_instance_prompt and self.instance_dot_prod_scoring is not None:
@@ -3640,6 +3684,7 @@ class Sam3Image(torch.nn.Module):
             if is_instance_prompt and self.instance_class_embed is not None:
                 class_embed_head = self.instance_class_embed
             outputs_class = class_embed_head(hs)
+        _dtype_debug("_update_scores: outputs_class", outputs_class=outputs_class)
 
         box_head = self.transformer.decoder.bbox_embed
         if (
@@ -3662,9 +3707,12 @@ class Sam3Image(torch.nn.Module):
             prob_dec_presence_out = dec_presence_out.clone().sigmoid()
             if self.detach_presence_in_joint_score:
                 prob_dec_presence_out = prob_dec_presence_out.detach()
+            # Use float32 for the inverse_sigmoid round-trip to avoid bfloat16
+            # precision loss that collapses all logits to the same value.
+            orig_dtype = outputs_class.dtype
             outputs_class = inverse_sigmoid(
-                outputs_class.sigmoid() * prob_dec_presence_out.unsqueeze(2)
-            ).clamp(min=-10.0, max=10.0)
+                outputs_class.float().sigmoid() * prob_dec_presence_out.float().unsqueeze(2)
+            ).clamp(min=-10.0, max=10.0).to(orig_dtype)
 
         _update_out(
             out, "pred_logits", outputs_class[:, :, :num_o2o], update_aux=self.training
@@ -3902,7 +3950,7 @@ class Sam3Image(torch.nn.Module):
         )
 
         vision_feats[-1] = (
-            vision_feats[-1] + self.inst_interactive_predictor.model.no_mem_embed
+            vision_feats[-1] + self.inst_interactive_predictor.model.no_mem_embed.to(vision_feats[-1].device)
         )
         import os as _os
         if _os.environ.get("DEBUG_COMFYUI_SAM3", "").lower() in ("1", "true", "yes"):
@@ -3946,7 +3994,7 @@ class Sam3Image(torch.nn.Module):
             backbone_out
         )
         vision_feats[-1] = (
-            vision_feats[-1] + self.inst_interactive_predictor.model.no_mem_embed
+            vision_feats[-1] + self.inst_interactive_predictor.model.no_mem_embed.to(vision_feats[-1].device)
         )
         batch_size = vision_feats[-1].shape[1]
         orig_heights, orig_widths = (
@@ -4264,7 +4312,11 @@ class Sam3TrackerBase(torch.nn.Module):
 
     @property
     def device(self):
-        return next(self.parameters()).device
+        return getattr(self, "_device", None) or next(self.parameters()).device
+
+    @device.setter
+    def device(self, value):
+        self._device = value
 
     def _get_tpos_enc(self, rel_pos_list, device, max_abs_pos=None, dummy=False):
         if dummy:
@@ -4441,7 +4493,7 @@ class Sam3TrackerBase(torch.nn.Module):
         lambda_is_obj_appearing = is_obj_appearing.float()
 
         obj_ptr = lambda_is_obj_appearing * obj_ptr
-        obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * self.no_obj_ptr
+        obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * comfy.ops.cast_to_input(self.no_obj_ptr, obj_ptr)
 
         return (
             low_res_multimasks,
@@ -4479,7 +4531,7 @@ class Sam3TrackerBase(torch.nn.Module):
         lambda_is_obj_appearing = is_obj_appearing.float()
         object_score_logits = out_scale * lambda_is_obj_appearing + out_bias
         obj_ptr = lambda_is_obj_appearing * obj_ptr
-        obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * self.no_obj_ptr
+        obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * comfy.ops.cast_to_input(self.no_obj_ptr, obj_ptr)
 
         return (
             low_res_masks,
@@ -4683,11 +4735,11 @@ class Sam3TrackerBase(torch.nn.Module):
                     is_selected_cond_frame
                     and getattr(self, "cond_frame_spatial_embedding", None) is not None
                 ):
-                    maskmem_enc = maskmem_enc + self.cond_frame_spatial_embedding
+                    maskmem_enc = maskmem_enc + comfy.ops.cast_to_input(self.cond_frame_spatial_embedding, maskmem_enc)
 
                 t = t_pos if not is_selected_cond_frame else 0
                 maskmem_enc = (
-                    maskmem_enc + self.maskmem_tpos_enc[self.num_maskmem - t - 1]
+                    maskmem_enc + comfy.ops.cast_to_input(self.maskmem_tpos_enc[self.num_maskmem - t - 1], maskmem_enc)
                 )
                 to_cat_prompt_pos_embed.append(maskmem_enc)
 
@@ -4767,13 +4819,13 @@ class Sam3TrackerBase(torch.nn.Module):
             else:
                 num_obj_ptr_tokens = 0
         else:
-            pix_feat_with_mem = current_vision_feats[-1] + self.no_mem_embed
+            pix_feat_with_mem = current_vision_feats[-1] + comfy.ops.cast_to_input(self.no_mem_embed, current_vision_feats[-1])
             pix_feat_with_mem = pix_feat_with_mem.permute(1, 2, 0).view(B, C, H, W)
             return pix_feat_with_mem
 
-            to_cat_prompt = [self.no_mem_embed.expand(1, B, self.mem_dim)]
+            to_cat_prompt = [comfy.ops.cast_to_input(self.no_mem_embed, current_vision_feats[-1]).expand(1, B, self.mem_dim)]
             to_cat_prompt_mask = [torch.zeros(B, 1, device=device, dtype=bool)]
-            to_cat_prompt_pos_embed = [self.no_mem_pos_enc.expand(1, B, self.mem_dim)]
+            to_cat_prompt_pos_embed = [comfy.ops.cast_to_input(self.no_mem_pos_enc, current_vision_feats[-1]).expand(1, B, self.mem_dim)]
 
         prompt = torch.cat(to_cat_prompt, dim=0)
         prompt_mask = None
@@ -4832,7 +4884,7 @@ class Sam3TrackerBase(torch.nn.Module):
         is_obj_appearing = (object_score_logits > 0).float()
         maskmem_features += (
             1 - is_obj_appearing[..., None, None]
-        ) * self.no_obj_embed_spatial[..., None, None].expand(*maskmem_features.shape)
+        ) * comfy.ops.cast_to_input(self.no_obj_embed_spatial, maskmem_features)[..., None, None].expand(*maskmem_features.shape)
 
         return maskmem_features, maskmem_pos_enc
 
@@ -5785,9 +5837,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
             reverse,
         )
 
-        for frame_idx in tqdm(
-            processing_order, desc="propagate in video", disable=tqdm_disable
-        ):
+        for frame_idx in processing_order:
             if frame_idx in consolidated_frame_inds["cond_frame_outputs"]:
                 storage_key = "cond_frame_outputs"
                 current_out = output_dict[storage_key][frame_idx]
@@ -6334,6 +6384,10 @@ class Sam3VideoBase(nn.Module):
     def device(self):
         self._device = getattr(self, "_device", None) or next(self.parameters()).device
         return self._device
+
+    @device.setter
+    def device(self, value):
+        self._device = value
 
     def _init_dist_pg_cpu(self):
         timeout_sec = int(os.getenv("SAM3_COLLECTIVE_OP_TIMEOUT_SEC", "180"))
@@ -7695,8 +7749,7 @@ class Sam3VideoInference(Sam3VideoBase):
         video_loader_type="cv2",
     ):
         """Initialize an inference state from `resource_path` (an image or a video)."""
-        # Get actual current device from model parameters
-        device = next(self.parameters()).device
+        device = self.device
 
         images, orig_height, orig_width = load_resource_as_video_frames(
             resource_path=resource_path,
@@ -7754,8 +7807,7 @@ class Sam3VideoInference(Sam3VideoBase):
         """Construct an initial `BatchedDatapoint` instance as input."""
         # 1) img_batch
         num_frames = len(images)
-        # Get actual current device from model parameters (handles dynamic device changes)
-        device = next(self.parameters()).device
+        device = self.device
 
         # 2) find_text_batch
         # "<text placeholder>" will be replaced by the actual text prompt when adding prompts
@@ -7927,9 +7979,7 @@ class Sam3VideoInference(Sam3VideoBase):
         # e.g., we output an object on frame 4 only if it becomes confirmed on frame 6.
         unconfirmed_status_delay = self.masklet_confirmation_consecutive_det_thresh - 1
         unconfirmed_obj_ids_per_frame = {}  # frame_idx -> hidden_obj_ids
-        for frame_idx in tqdm(
-            processing_order, desc="propagate_in_video", disable=self.rank > 0
-        ):
+        for frame_idx in processing_order:
             out = self._run_single_frame_inference(inference_state, frame_idx, reverse)
 
             if self.hotstart_delay > 0:
@@ -8267,7 +8317,7 @@ class Sam3VideoInference(Sam3VideoBase):
         feat_size = self.tracker.sam_image_embedding_size**2  # 72 * 72 = 5184
         hidden_dim = self.tracker.hidden_dim  # 256
         mem_dim = self.tracker.mem_dim  # 64
-        for _ in tqdm(range(num_iters)):
+        for _ in range(num_iters):
             for b in range(1, self.num_obj_for_compile + 1):
                 for i in range(
                     1,
@@ -8554,7 +8604,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
 
         # if fetch just return from output
         if propagation_type == "propagation_fetch":
-            for frame_idx in tqdm(processing_order):
+            for frame_idx in processing_order:
                 if self.rank == 0:
                     obj_id_to_mask = inference_state["cached_frame_outputs"].get(
                         frame_idx, {}
@@ -8595,7 +8645,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                     tracker_state, run_mem_encoder=True
                 )
 
-        for frame_idx in tqdm(processing_order):
+        for frame_idx in processing_order:
             # run Tracker propagation
             if propagation_type == "propagation_partial":
                 self._prepare_backbone_feats(inference_state, frame_idx, reverse)
@@ -9305,7 +9355,7 @@ class SAM3InteractiveImagePredictor(nn.Module):
             _,
             _,
         ) = self.model._prepare_backbone_features(backbone_out)
-        vision_feats[-1] = vision_feats[-1] + self.model.no_mem_embed
+        vision_feats[-1] = vision_feats[-1] + self.model.no_mem_embed.to(vision_feats[-1].device)
 
         feats = [
             feat.permute(1, 2, 0).view(1, -1, *feat_size)
@@ -9343,7 +9393,7 @@ class SAM3InteractiveImagePredictor(nn.Module):
             _,
             _,
         ) = self.model._prepare_backbone_features(backbone_out)
-        vision_feats[-1] = vision_feats[-1] + self.model.no_mem_embed
+        vision_feats[-1] = vision_feats[-1] + self.model.no_mem_embed.to(vision_feats[-1].device)
 
         feats = [
             feat.permute(1, 2, 0).view(batch_size, -1, *feat_size)
@@ -9450,21 +9500,24 @@ class SAM3InteractiveImagePredictor(nn.Module):
         self, point_coords, point_labels, box, mask_logits, normalize_coords, img_idx=-1
     ):
         unnorm_coords, labels, unnorm_box, mask_input = None, None, None, None
+        # Use image features device as compute device — in offload mode
+        # self.device returns CPU (parameter device) but computation runs on CUDA.
+        _dev = self._features["image_embed"][-1].device if self._features is not None else self.device
         if point_coords is not None:
             assert (
                 point_labels is not None
             ), "point_labels must be supplied if point_coords is supplied."
             point_coords = torch.as_tensor(
-                point_coords, dtype=torch.float, device=self.device
+                point_coords, dtype=torch.float, device=_dev
             )
             unnorm_coords = self._transforms.transform_coords(
                 point_coords, normalize=normalize_coords, orig_hw=self._orig_hw[img_idx]
             )
-            labels = torch.as_tensor(point_labels, dtype=torch.int, device=self.device)
+            labels = torch.as_tensor(point_labels, dtype=torch.int, device=_dev)
             if len(unnorm_coords.shape) == 2:
                 unnorm_coords, labels = unnorm_coords[None, ...], labels[None, ...]
         if box is not None:
-            box = torch.as_tensor(box, dtype=torch.float, device=self.device)
+            box = torch.as_tensor(box, dtype=torch.float, device=_dev)
             unnorm_box = self._transforms.transform_boxes(
                 box, normalize=normalize_coords, orig_hw=self._orig_hw[img_idx]
             )  # Bx2x2
@@ -9475,10 +9528,10 @@ class SAM3InteractiveImagePredictor(nn.Module):
             # which promotes src to fp32 and crashes the matmul against bf16
             # hyper_in in predict_masks.
             if isinstance(mask_logits, torch.Tensor):
-                mask_input = mask_logits.to(device=self.device)
+                mask_input = mask_logits.to(device=_dev)
             else:
                 mask_input = torch.as_tensor(
-                    mask_logits, dtype=torch.float, device=self.device
+                    mask_logits, dtype=torch.float, device=_dev
                 )
             if len(mask_input.shape) == 3:
                 mask_input = mask_input[None, :, :, :]
@@ -9566,6 +9619,10 @@ class SAM3InteractiveImagePredictor(nn.Module):
     @property
     def device(self):
         return self.model.device
+
+    @device.setter
+    def device(self, value):
+        self.model.device = value
 
     def reset_predictor(self):
         """Resets the image embeddings and other state variables."""

@@ -266,6 +266,13 @@ class SAM3VideoState:
             ]
         }
 
+    @staticmethod
+    def _deep_to_tuple(obj):
+        """Recursively convert lists to tuples (JSON deserializes tuples as lists)."""
+        if isinstance(obj, list):
+            return tuple(SAM3VideoState._deep_to_tuple(item) for item in obj)
+        return obj
+
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'SAM3VideoState':
         """
@@ -282,7 +289,7 @@ class SAM3VideoState:
                 frame_idx=p["frame_idx"],
                 prompt_type=p["prompt_type"],
                 obj_id=p["obj_id"],
-                data=tuple(p["data"]) if isinstance(p["data"], list) else p["data"]
+                data=cls._deep_to_tuple(p["data"])
             )
             for p in d.get("prompts", [])
         )
@@ -328,6 +335,8 @@ def create_video_state(
     """
     import numpy as np
     from PIL import Image
+    import comfy.model_management
+    import comfy.utils
 
     session_uuid = session_id if session_id else str(uuid.uuid4())
     temp_dir = create_temp_dir(session_uuid)
@@ -339,12 +348,15 @@ def create_video_state(
 
     log.info(f"Saving {num_frames} frames to {temp_dir}")
 
+    pbar = comfy.utils.ProgressBar(num_frames)
     for i in range(num_frames):
+        comfy.model_management.throw_exception_if_processing_interrupted()
         frame = video_frames[i].cpu().numpy()
         # Convert from [H, W, C] float32 0-1 to uint8 0-255
         frame = (frame * 255).astype(np.uint8)
         img = Image.fromarray(frame)
         img.save(os.path.join(temp_dir, f"{i:05d}.jpg"))
+        pbar.update(1)
 
     log.info("Frames saved successfully")
 
@@ -380,6 +392,8 @@ def create_video_state_from_file(
     """
     import cv2
     from PIL import Image as PILImage
+    import comfy.model_management
+    import comfy.utils
 
     session_uuid = session_id if session_id else str(uuid.uuid4())
     temp_dir = create_temp_dir(session_uuid)
@@ -394,8 +408,10 @@ def create_video_state_from_file(
 
     log.info(f"Extracting frames from {video_path} ({total_frames} frames, {width}x{height})")
 
+    pbar = comfy.utils.ProgressBar(total_frames)
     frame_idx = 0
     while True:
+        comfy.model_management.throw_exception_if_processing_interrupted()
         ret, frame = cap.read()
         if not ret:
             break
@@ -404,6 +420,7 @@ def create_video_state_from_file(
         img = PILImage.fromarray(frame_rgb)
         img.save(os.path.join(temp_dir, f"{frame_idx:05d}.jpg"))
         frame_idx += 1
+        pbar.update(1)
     cap.release()
 
     if frame_idx == 0:

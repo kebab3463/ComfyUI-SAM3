@@ -1125,9 +1125,10 @@ class AsyncVideoFileLoaderWithTorchCodec:
             img_std = torch.tensor(img_std, dtype=float_dtype)[:, None, None]
         self.img_std = img_std
         if self.gpu_acceleration:
-            self.img_mean = self.img_mean.to(f"cuda:{self.gpu_id}")
-            self.img_std = self.img_std.to(f"cuda:{self.gpu_id}")
-            decoder_option = {"device": f"cuda:{self.gpu_id}"}
+            _gpu_device = comfy.model_management.get_torch_device()
+            self.img_mean = self.img_mean.to(_gpu_device)
+            self.img_std = self.img_std.to(_gpu_device)
+            decoder_option = {"device": str(_gpu_device)}
         else:
             self.img_mean = self.img_mean.to(out_device)
             self.img_std = self.img_std.to(out_device)
@@ -1275,7 +1276,9 @@ class Sam3Processor:
         self.model = model
         self.resolution = resolution
         if device is None:
-            device = str(comfy.model_management.get_torch_device())
+            device = comfy.model_management.get_torch_device()
+        elif isinstance(device, str):
+            device = torch.device(device)
         self.device = device
         self.transform = v2.Compose(
             [
@@ -1304,17 +1307,18 @@ class Sam3Processor:
             height, width = image.shape[-2:]
         else:
             raise ValueError("Image must be a PIL image or a tensor")
-        try:
-            model_device = next(self.model.parameters()).device
-        except StopIteration:
-            model_device = torch.device(self.device)
-        image = v2.functional.to_image(image).to(model_device)
-        image = self.transform(image).unsqueeze(0)
-        # Native ComfyUI pattern: cast input to target dtype at the pipeline
-        # boundary. manual_cast layers will cast their fp32 weights to match.
-        inference_dtype = getattr(self, '_inference_dtype', None)
-        if inference_dtype is not None and inference_dtype in (torch.float16, torch.bfloat16):
-            image = image.to(dtype=inference_dtype)
+        # Transform on CPU first (resize from e.g. 6720x4480 to 1008x1008),
+        # then move only the small tensor to GPU.  Avoids a large transient
+        # GPU allocation that can destabilise cudaMallocAsync in lowvram mode.
+        image = v2.functional.to_image(image)
+        image = self.transform(image).unsqueeze(0).to(self.device)
+        # Cast image to match the backbone's native weight dtype so that
+        # manual_cast keeps weights in their stored precision (typically bf16).
+        # Without this, an fp32 image causes manual_cast to promote bf16
+        # weights to fp32, producing different features than the original model.
+        backbone_dtype = next(self.model.backbone.parameters()).dtype
+        if backbone_dtype != image.dtype:
+            image = image.to(dtype=backbone_dtype)
         state["original_height"] = height
         state["original_width"] = width
         state["backbone_out"] = self.model.backbone.forward_image(image)
@@ -1344,18 +1348,14 @@ class Sam3Processor:
         assert isinstance(images[0], Image.Image), "Images must be a list of PIL images"
         state["original_heights"] = [image.height for image in images]
         state["original_widths"] = [image.width for image in images]
-        try:
-            model_device = next(self.model.parameters()).device
-        except StopIteration:
-            model_device = torch.device(self.device)
         images = [
-            self.transform(v2.functional.to_image(image).to(model_device))
+            self.transform(v2.functional.to_image(image).to(self.device))
             for image in images
         ]
         images = torch.stack(images, dim=0)
-        inference_dtype = getattr(self, '_inference_dtype', None)
-        if inference_dtype is not None and inference_dtype in (torch.float16, torch.bfloat16):
-            images = images.to(dtype=inference_dtype)
+        backbone_dtype = next(self.model.backbone.parameters()).dtype
+        if backbone_dtype != images.dtype:
+            images = images.to(dtype=backbone_dtype)
         state["backbone_out"] = self.model.backbone.forward_image(images)
         inst_interactivity_en = self.model.inst_interactive_predictor is not None
         if inst_interactivity_en and "sam2_backbone_out" in state["backbone_out"]:
@@ -1376,7 +1376,17 @@ class Sam3Processor:
     def set_text_prompt(self, prompt: str, state: Dict):
         if "backbone_out" not in state:
             raise ValueError("You must call set_image before set_text_prompt")
+        log.debug(f"[DEBUG] set_text_prompt: prompt='{prompt}', device={self.device}")
         text_outputs = self.model.backbone.forward_text([prompt], device=self.device)
+        # Debug: inspect text encoder output
+        if "language_features" in text_outputs:
+            lf = text_outputs["language_features"]
+            log.debug(f"[DEBUG] language_features: shape={lf.shape}, dtype={lf.dtype}, "
+                     f"min={lf.min():.4f}, max={lf.max():.4f}, mean={lf.mean():.4f}")
+        if "language_mask" in text_outputs:
+            lm = text_outputs["language_mask"]
+            log.debug(f"[DEBUG] language_mask: shape={lm.shape}, dtype={lm.dtype}, "
+                     f"num_valid={(~lm).sum().item()}, num_padding={lm.sum().item()}")
         state["backbone_out"].update(text_outputs)
         if "geometric_prompt" not in state:
             state["geometric_prompt"] = self.model._get_dummy_prompt()
@@ -1442,18 +1452,6 @@ class Sam3Processor:
         state["geometric_prompt"].append_masks(mask)
         return self._forward_grounding(state)
 
-    def sync_device_with_model(self):
-        try:
-            model_device = next(self.model.parameters()).device
-            self.device = str(model_device)
-            if self.find_stage is not None:
-                if self.find_stage.img_ids is not None:
-                    self.find_stage.img_ids = self.find_stage.img_ids.to(model_device)
-                if self.find_stage.text_ids is not None:
-                    self.find_stage.text_ids = self.find_stage.text_ids.to(model_device)
-        except StopIteration:
-            pass
-
     def reset_all_prompts(self, state: Dict):
         if "backbone_out" in state:
             backbone_keys_to_del = ["language_features", "language_mask", "language_embeds"]
@@ -1474,6 +1472,8 @@ class Sam3Processor:
 
     @torch.inference_mode()
     def _forward_grounding(self, state: Dict):
+        from .perflib import nms_masks
+
         outputs = self.model.forward_grounding(
             backbone_out=state["backbone_out"],
             find_input=self.find_stage,
@@ -1483,11 +1483,34 @@ class Sam3Processor:
         out_bbox = outputs["pred_boxes"]
         out_logits = outputs["pred_logits"]
         out_masks = outputs["pred_masks"]
-        out_probs = out_logits.sigmoid().squeeze(-1)
+
+        # Match the original SAM3 processor: multiply class logits by presence
+        # score explicitly. This is how the model was trained and evaluated.
+        out_probs = out_logits.float().sigmoid()
+        presence_score = outputs["presence_logit_dec"].float().sigmoid().unsqueeze(1)
+        out_probs = (out_probs * presence_score).squeeze(-1)
+
         keep = out_probs > self.confidence_threshold
         out_probs = out_probs[keep]
         out_masks = out_masks[keep]
         out_bbox = out_bbox[keep]
+
+        log.debug(f"[DEBUG] after threshold: {out_probs.numel()} detections")
+
+        # Apply mask-based NMS to suppress overlapping detections
+        if out_probs.numel() > 1:
+            nms_keep = nms_masks(
+                pred_probs=out_probs,
+                pred_masks=out_masks,
+                prob_threshold=0.0,  # already thresholded above
+                iou_threshold=0.5,
+            )
+            n_before = out_probs.numel()
+            out_probs = out_probs[nms_keep]
+            out_masks = out_masks[nms_keep]
+            out_bbox = out_bbox[nms_keep]
+            log.debug(f"[DEBUG] after NMS (iou_thresh=0.5): {out_probs.numel()} detections (suppressed {n_before - out_probs.numel()})")
+
         boxes = box_cxcywh_to_xyxy(out_bbox)
         img_h = state["original_height"]
         img_w = state["original_width"]
